@@ -31,6 +31,7 @@
 #ifndef RFM69_h
 #define RFM69_h
 #include <Arduino.h>            // assumes Arduino IDE v1.0 or greater
+#include <SPI.h>
 
 #define RF69_MAX_DATA_LEN       61 // to take advantage of the built in AES/CRC we want to limit the frame size to the internal FIFO size (66 bytes - 3 bytes overhead - 2 bytes crc)
 #define RF69_SPI_CS             SS // SS is the SPI slave select pin, for instance D10 on ATmega328
@@ -79,6 +80,7 @@ class RFM69 {
     static volatile uint8_t ACK_RECEIVED; // should be polled immediately after sending a packet with ACK request
     static volatile int16_t RSSI; // most accurate RSSI during reception (closest to the reception)
     static volatile uint8_t _mode; // should be protected?
+    static volatile byte ACK_RSSI_REQUESTED;  // new flag in CTL byte to request RSSI with ACK (could potentially be merged with ACK_REQUESTED)
 
     RFM69(uint8_t slaveSelectPin=RF69_SPI_CS, uint8_t interruptPin=RF69_IRQ_PIN, bool isRFM69HW=false, uint8_t interruptNum=RF69_IRQ_NUM) {
       _slaveSelectPin = slaveSelectPin;
@@ -92,7 +94,7 @@ class RFM69 {
 
     bool initialize(uint8_t freqBand, uint8_t ID, uint8_t networkID=1);
     void setAddress(uint8_t addr);
-    void setNetwork(uint8_t networkID);
+    void setNetwork(uint8_t networkID=1);
     bool canSend();
     void send(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK=false);
     bool sendWithRetry(uint8_t toAddress, const void* buffer, uint8_t bufferSize, uint8_t retries=2, uint8_t retryWaitTime=40); // 40ms roundtrip req for 61byte packets
@@ -106,38 +108,52 @@ class RFM69 {
     void setCS(uint8_t newSPISlaveSelect);
     int16_t readRSSI(bool forceTrigger=false);
     void promiscuous(bool onOff=true);
-    void setHighPower(bool onOFF=true); // has to be called after initialize() for RFM69HW
+    void setHighPower(bool onOFF=true, byte PA_ctl=0x60); //have to call it after initialize for RFM69HW
     void setPowerLevel(uint8_t level); // reduce/increase transmit power level
+    int  enableAutoPower(int targetRSSI=-69);   // TWS: New method to enable/disable auto Power control
+    int  getAckRSSI(void);                      // TWS: New method to retrieve the ack'd RSSI (if any)
+    byte setLNA(byte newReg);                   // TWS: function to control LNA reg for power testing purposes
     void sleep();
     uint8_t readTemperature(uint8_t calFactor=0); // get CMOS temperature (8bit)
     void rcCalibration(); // calibrate the internal RC oscillator for use in wide temperature variations - see datasheet section [4.3.5. RC Timer Accuracy]
+    void setMode(byte mode);  // TWS: moved from protected to try to build block()/unblock() wrapper
 
     // allow hacking registers by making these public
     uint8_t readReg(uint8_t addr);
     void writeReg(uint8_t addr, uint8_t val);
     void readAllRegs();
+    int  _targetRSSI;     // if non-zero then this is the desired end point RSSI for our transmission
+    byte _transmitLevel;  // saved powerLevel in case we do auto power adjustment, this value gets dithered
 
   protected:
     static void isr0();
     void virtual interruptHandler();
-    void sendFrame(uint8_t toAddress, const void* buffer, uint8_t size, bool requestACK=false, bool sendACK=false);
+    void sendFrame(byte toAddress, const void* buffer, byte size, bool requestACK=false, bool sendACK=false, bool sendRSSI=false, int lastRSSI=0);
 
     static RFM69* selfPointer;
     uint8_t _slaveSelectPin;
     uint8_t _interruptPin;
     uint8_t _interruptNum;
     uint8_t _address;
-    bool _promiscuousMode;
+    bool    _promiscuousMode;
     uint8_t _powerLevel;
-    bool _isRFM69HW;
+    bool    _isRFM69HW;
     uint8_t _SPCR;
     uint8_t _SPSR;
+    uint8_t _SREG;
+    int16_t _ackRSSI;         // this contains the RSSI our destination Ack'd back to us (if we enabledAutoPower)
+    bool    _powerBoost;      // this controls whether we need to turn on the highpower regs based on the setPowerLevel input
+    uint8_t _PA_Reg;          // saved and derived PA control bits so we don't have to spend time reading back from SPI port
 
     void receiveBegin();
-    void setMode(uint8_t mode);
+//    void setMode(uint8_t mode);  // TWS: moved to public to create blocking method
     void setHighPowerRegs(bool onOff);
     void select();
     void unselect();
+    
+#ifdef SPI_HAS_TRANSACTION
+    SPISettings _settings;
+#endif
 };
 
 #endif

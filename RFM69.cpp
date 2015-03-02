@@ -41,6 +41,7 @@ volatile uint8_t RFM69::PAYLOADLEN;
 volatile uint8_t RFM69::ACK_REQUESTED;
 volatile uint8_t RFM69::ACK_RECEIVED; // should be polled immediately after sending a packet with ACK request
 volatile int16_t RFM69::RSSI;          // most accurate RSSI during reception (closest to the reception)
+volatile byte RFM69::ACK_RSSI_REQUESTED;
 RFM69* RFM69::selfPointer;
 
 bool RFM69::initialize(uint8_t freqBand, uint8_t nodeID, uint8_t networkID)
@@ -90,7 +91,8 @@ bool RFM69::initialize(uint8_t freqBand, uint8_t nodeID, uint8_t networkID)
   digitalWrite(_slaveSelectPin, HIGH);
   pinMode(_slaveSelectPin, OUTPUT);
   SPI.begin();
-
+  _settings = SPISettings(4000000, MSBFIRST, SPI_MODE0);
+  
   do writeReg(REG_SYNCVALUE1, 0xAA); while (readReg(REG_SYNCVALUE1) != 0xAA);
   do writeReg(REG_SYNCVALUE1, 0x55); while (readReg(REG_SYNCVALUE1) != 0x55);
 
@@ -101,9 +103,19 @@ bool RFM69::initialize(uint8_t freqBand, uint8_t nodeID, uint8_t networkID)
   // Disable it during initialization so we always start from a known state.
   encrypt(0);
 
-  setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
+  _targetRSSI = 0;        // TWS: default to disabled
+  _ackRSSI = 0;           // TWS: no existing response yet...
+  ACK_RSSI_REQUESTED = 0; // TWS: init to none
+  
+  _powerBoost = false;    // TWS: require someone to explicitly turn boost on!
+  _transmitLevel = 31;    // TWS: match default value in PA Level register...
+  setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW (TWS: will set _PA_Reg);
   setMode(RF69_MODE_STANDBY);
   while ((readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00); // wait for ModeReady
+
+#ifdef SPI_HAS_TRANSACTION
+  SPI.usingInterrupt(_interruptNum);
+#endif
   attachInterrupt(_interruptNum, RFM69::isr0, RISING);
 
   selfPointer = this;
@@ -142,6 +154,7 @@ void RFM69::setMode(uint8_t newMode)
   switch (newMode) {
     case RF69_MODE_TX:
       writeReg(REG_OPMODE, (readReg(REG_OPMODE) & 0xE3) | RF_OPMODE_TRANSMITTER);
+      if (_targetRSSI) setPowerLevel(_transmitLevel);   // TWS: apply most recent transmit level if auto power
       if (_isRFM69HW) setHighPowerRegs(true);
       break;
     case RF69_MODE_RX:
@@ -183,12 +196,39 @@ void RFM69::setNetwork(uint8_t networkID)
   writeReg(REG_SYNCVALUE2, networkID);
 }
 
-// set output power: 0 = min, 31 = max
+// set output power: 0=min, 31=max (for RFM69W or RFM69CW), 0-31 or 32->51 for RFM69HW (see below)
 // this results in a "weaker" transmitted signal, and directly results in a lower RSSI at the receiver
 void RFM69::setPowerLevel(uint8_t powerLevel)
 {
-  _powerLevel = powerLevel;
-  writeReg(REG_PALEVEL, (readReg(REG_PALEVEL) & 0xE0) | (_powerLevel > 31 ? 31 : _powerLevel));
+  // TWS Update: allow power level selections above 31.  Select appropriate PA based on the value
+    
+  _transmitLevel = powerLevel;    // save this for later in case we do auto power control.
+  _powerBoost = (powerLevel >= 50);
+  
+  if (!_isRFM69HW || powerLevel < 32) {     // use original code without change
+    _powerLevel = powerLevel;
+    writeReg(REG_PALEVEL, (readReg(REG_PALEVEL) & 0xE0) | (_powerLevel > 31 ? 31 : _powerLevel));
+  } else {
+    // the allowable range of power level value, if >31 is: 32 -> 51, where...
+    // 32->47 use PA2 only and sets powerLevel register 0-15,
+    // 48->49 uses both PAs, and sets powerLevel register 14-15,
+    // 50->51 uses both PAs, sets powerBoost, and sets powerLevel register 14-15.
+    if (powerLevel < 48) {
+      _powerLevel = powerLevel & 0x0f;  // just use 4 lower bits when in high power mode
+      _PA_Reg = 0x20;
+    } else {
+      _PA_Reg = 0x60;
+      if (powerLevel < 50) {
+        _powerLevel = powerLevel - 34;  // leaves 14-15
+      } else {
+        if (powerLevel > 51) 
+          powerLevel = 51;  // saturate
+        _powerLevel = powerLevel - 36;  // leaves 14-15
+      }
+    }
+    writeReg(REG_OCP, (_PA_Reg==0x60) ? RF_OCP_OFF : RF_OCP_ON);
+    writeReg(REG_PALEVEL, _powerLevel | _PA_Reg);
+  }
 }
 
 bool RFM69::canSend()
@@ -250,26 +290,23 @@ bool RFM69::ACKRequested() {
 void RFM69::sendACK(const void* buffer, uint8_t bufferSize) {
   uint8_t sender = SENDERID;
   int16_t _RSSI = RSSI; // save payload received RSSI value
+  bool sendRSSI = ACK_RSSI_REQUESTED;  
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
   uint32_t now = millis();
   while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
-  sendFrame(sender, buffer, bufferSize, false, true);
+  SENDERID = sender;    // TWS: Restore SenderID after it gets wiped out by receiveDone()
+  sendFrame(sender, buffer, bufferSize, false, true, sendRSSI, _RSSI);
   RSSI = _RSSI; // restore payload RSSI
 }
 
-void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, bool sendACK)
+void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, bool sendACK, bool sendRSSI, int16_t lastRSSI)
 {
   setMode(RF69_MODE_STANDBY); // turn off receiver to prevent reception while filling fifo
   while ((readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00); // wait for ModeReady
   writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_00); // DIO0 is "Packet Sent"
+  
+  bufferSize += (sendACK && sendRSSI)?2:0;  // if sending ACK_RSSI then increase data size by two
   if (bufferSize > RF69_MAX_DATA_LEN) bufferSize = RF69_MAX_DATA_LEN;
-
-  // control byte
-  uint8_t CTLbyte = 0x00;
-  if (sendACK)
-    CTLbyte = 0x80;
-  else if (requestACK)
-    CTLbyte = 0x40;
 
   // write to FIFO
   select();
@@ -277,7 +314,23 @@ void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize,
   SPI.transfer(bufferSize + 3);
   SPI.transfer(toAddress);
   SPI.transfer(_address);
-  SPI.transfer(CTLbyte);
+
+  // control byte
+  if (sendACK) {              // TWS: adding logic to return ACK_RSSI if requested
+    SPI.transfer(0x80 | (sendRSSI?0x20:0));  // TWS
+    if (sendRSSI) {
+      SPI.transfer(lastRSSI>>8);    // TWS: send high byte
+      SPI.transfer(lastRSSI & 0x00ff);  // TWS: send low byte
+      bufferSize -=2;           // account for these two 'data' bytes
+    }
+  }
+  else if (requestACK) {      // TWS: need to add logic to request ackRSSI with ACK
+    if (_targetRSSI)          // TWS
+      SPI.transfer(0x60);     // TWS: ASK for ACK + ASK for RSSI
+    else                      // TWS:
+     SPI.transfer(0x40);
+  }
+  else SPI.transfer(0x00);
 
   for (uint8_t i = 0; i < bufferSize; i++)
     SPI.transfer(((uint8_t*) buffer)[i]);
@@ -317,8 +370,30 @@ void RFM69::interruptHandler() {
     SENDERID = SPI.transfer(0);
     uint8_t CTLbyte = SPI.transfer(0);
 
-    ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
-    ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
+    ACK_RECEIVED = CTLbyte & 0x80; //extract ACK-requested flag
+    ACK_REQUESTED = CTLbyte & 0x40; //extract ACK-received flag
+    ACK_RSSI_REQUESTED = CTLbyte & 0x20; // TWS: extract the ACK RSSI request bit (could potentially merge with ACK_REQUESTED)
+    
+    // TWS: now see if this was an ACK with an ACK_RSSI response
+    if (ACK_RECEIVED && ACK_RSSI_REQUESTED) {
+      // the next two bytes contain the ACK_RSSI (assuming the datalength is valid)
+      if (DATALEN >= 2) {
+        _ackRSSI = SPI.transfer(0)<<8;  // get high byte
+        _ackRSSI |= (SPI.transfer(0) & 0xff);  // merge with low
+        DATALEN -= 2;   // and compensate data length accordingly
+        // TWS: Now dither transmitLevel value (register update occurs later when transmitting);
+        if (_targetRSSI != 0) {
+          if (_isRFM69HW) {
+            if (_ackRSSI < _targetRSSI && _transmitLevel < 51) _transmitLevel++;
+            else if (_ackRSSI > _targetRSSI && _transmitLevel > 32) _transmitLevel--;
+          } else {
+            if (_ackRSSI < _targetRSSI && _transmitLevel < 31) _transmitLevel++;
+            else if (_ackRSSI > _targetRSSI && _transmitLevel > 0) _transmitLevel--;
+          }
+        }
+      }
+    }
+    
 
     for (uint8_t i = 0; i < DATALEN; i++)
     {
@@ -341,6 +416,7 @@ void RFM69::receiveBegin() {
   PAYLOADLEN = 0;
   ACK_REQUESTED = 0;
   ACK_RECEIVED = 0;
+  ACK_RSSI_REQUESTED = 0;
   RSSI = 0;
   if (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY)
     writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
@@ -351,18 +427,27 @@ void RFM69::receiveBegin() {
 bool RFM69::receiveDone() {
 //ATOMIC_BLOCK(ATOMIC_FORCEON)
 //{
-  noInterrupts(); // re-enabled in unselect() via setMode() or via receiveBegin()
+  uint8_t rd_SREG = SREG;
+  noInterrupts();
+  // Note: New SPI library prefers to use EIMSK (external interrupt mask) if available 
+  // to mask (only) interrupts registered via SPI::usingInterrupt(). It only 
+  // falls back to disabling ALL interrupts SREG if EIMSK cannot be used.
+  // Hence We cannot assume that methods calls below that call select() unselect() 
+  // will result in a call to noInterrupts(). 
+  // Thus the code below needs to explicitly do this to be safe.
   if (_mode == RF69_MODE_RX && PAYLOADLEN > 0)
   {
     setMode(RF69_MODE_STANDBY); // enables interrupts
+    SREG = rd_SREG;
     return true;
   }
   else if (_mode == RF69_MODE_RX) // already in RX no payload yet
   {
-    interrupts(); // explicitly re-enable interrupts
+    SREG = rd_SREG;
     return false;
   }
   receiveBegin();
+  SREG = rd_SREG;
   return false;
 //}
 }
@@ -415,24 +500,36 @@ void RFM69::writeReg(uint8_t addr, uint8_t value)
 
 // select the transceiver
 void RFM69::select() {
+#ifndef SPI_HAS_TRANSACTION
+  _SREG = SREG;
   noInterrupts();
+#endif
   // save current SPI settings
   _SPCR = SPCR;
   _SPSR = SPSR;
+#ifdef SPI_HAS_TRANSACTION
+  SPI.beginTransaction(_settings);
+
+#else
   // set RFM69 SPI settings
   SPI.setDataMode(SPI_MODE0);
   SPI.setBitOrder(MSBFIRST);
   SPI.setClockDivider(SPI_CLOCK_DIV4); // decided to slow down from DIV2 after SPI stalling in some instances, especially visible on mega1284p when RFM69 and FLASH chip both present
+#endif
   digitalWrite(_slaveSelectPin, LOW);
 }
 
 // UNselect the transceiver chip
 void RFM69::unselect() {
   digitalWrite(_slaveSelectPin, HIGH);
+#ifdef SPI_HAS_TRANSACTION
+  SPI.endTransaction();
+#else  
+  SREG = _SREG;
+#endif
   // restore SPI settings to what they were before talking to RFM69
   SPCR = _SPCR;
   SPSR = _SPSR;
-  interrupts();
 }
 
 // ON  = disable filtering to capture all frames on network
@@ -442,16 +539,25 @@ void RFM69::promiscuous(bool onOff) {
   //writeReg(REG_PACKETCONFIG1, (readReg(REG_PACKETCONFIG1) & 0xF9) | (onOff ? RF_PACKET1_ADRSFILTERING_OFF : RF_PACKET1_ADRSFILTERING_NODEBROADCAST));
 }
 
-void RFM69::setHighPower(bool onOff) {
+void RFM69::setHighPower(bool onOff, byte PA_ctl) {
   _isRFM69HW = onOff;
-  writeReg(REG_OCP, _isRFM69HW ? RF_OCP_OFF : RF_OCP_ON);
-  if (_isRFM69HW) // turning ON
-    writeReg(REG_PALEVEL, (readReg(REG_PALEVEL) & 0x1F) | RF_PALEVEL_PA1_ON | RF_PALEVEL_PA2_ON); // enable P1 & P2 amplifier stages
-  else
-    writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | _powerLevel); // enable P0 only
+    
+  writeReg(REG_OCP, (_isRFM69HW && PA_ctl==0x60) ? RF_OCP_OFF : RF_OCP_ON);
+  if (_isRFM69HW) { //turning ON based on module type 
+    _powerLevel = readReg(REG_PALEVEL) & 0x1F; // make sure internal value matches reg
+    _powerBoost = (PA_ctl == 0x60);
+    _PA_Reg = PA_ctl;
+    writeReg(REG_PALEVEL, _powerLevel | PA_ctl ); //TWS: enable selected P1 & P2 amplifier stages
+  }
+  else {
+    _PA_Reg = RF_PALEVEL_PA0_ON;        // TWS: save to reflect register value
+    writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | _powerLevel); //enable P0 only
+  }
 }
 
 void RFM69::setHighPowerRegs(bool onOff) {
+  if ((0x60 != (readReg(REG_PALEVEL) & 0xe0)) || !_powerBoost)    // TWS, only set to high power if we are using both PAs... and boost range is requested.
+    onOff = false;
   writeReg(REG_TESTPA1, onOff ? 0x5D : 0x55);
   writeReg(REG_TESTPA2, onOff ? 0x7C : 0x70);
 }
@@ -480,7 +586,6 @@ void RFM69::readAllRegs()
     Serial.print(" - ");
     Serial.println(regVal,BIN);
   }
-  unselect();
 }
 
 uint8_t RFM69::readTemperature(uint8_t calFactor) // returns centigrade
@@ -495,4 +600,24 @@ void RFM69::rcCalibration()
 {
   writeReg(REG_OSC1, RF_OSC1_RCCAL_START);
   while ((readReg(REG_OSC1) & RF_OSC1_RCCAL_DONE) == 0x00);
+}
+
+// TWS: New methods to address autoPower control
+int  RFM69::enableAutoPower(int targetRSSI){    // TWS: New method to enable/disable auto Power control
+  _targetRSSI = targetRSSI;         // no logic here, just set the value (if non-zero, then enabled), caller's responsibility to use a reasonable value
+}
+  
+
+int  RFM69::getAckRSSI(void){                     // TWS: New method to retrieve the ack'd RSSI (if any)
+  return (_targetRSSI==0?0:_ackRSSI);
+}
+
+byte RFM69::setLNA(byte newReg) {  // TWS: New method used to disable LNA AGC for testing purposes
+  byte oldReg;
+  
+  oldReg = readReg(REG_LNA);
+  
+  writeReg(REG_LNA, ((newReg & 7) | (oldReg & ~7)));   // just control the LNA Gain bits for now
+  
+  return oldReg;  // return the original value in case we need to restore it
 }
