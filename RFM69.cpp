@@ -320,13 +320,14 @@ void RFM69::interruptHandler() {
     ACK_RECEIVED = CTLbyte & RFM69_CTL_SENDACK; // extract ACK-received flag
     ACK_REQUESTED = CTLbyte & RFM69_CTL_REQACK; // extract ACK-requested flag
     
-    interruptHook(CTLbyte);     // TWS: hook to derived class interrupt function
-
-    for (uint8_t i = 0; i < DATALEN; i++)
-    {
-      DATA[i] = SPI.transfer(0);
-    }
-    if (DATALEN < RF69_MAX_DATA_LEN) DATA[DATALEN] = 0; // add null at end of string
+    bool processData = interruptHook(CTLbyte);  // hook to derived class interrupt function
+    if (processData) {
+      for (uint8_t i = 0; i < DATALEN; i++)
+      {
+        DATA[i] = SPI.transfer(0);
+      }
+      if (DATALEN < RF69_MAX_DATA_LEN) DATA[DATALEN] = 0; // add null at end of string
+	}
     unselect();
     setMode(RF69_MODE_RX);
   }

@@ -131,7 +131,7 @@ class RFM69 {
   protected:
     static void isr0();
     void virtual interruptHandler();
-    virtual void interruptHook(uint8_t CTLbyte) {};
+    virtual bool interruptHook(uint8_t CTLbyte) {};
     virtual void sendFrame(uint8_t toAddress, const void* buffer, uint8_t size, bool requestACK=false, bool sendACK=false);
 
     static RFM69* selfPointer;
